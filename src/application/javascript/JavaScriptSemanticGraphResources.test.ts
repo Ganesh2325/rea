@@ -359,3 +359,43 @@ const emptyAnalysis = (): JavaScriptArtifactAnalysis => ({
   parse_failures: 0,
   limitations: [],
 });
+
+it("projects unrelated `this` receivers as candidate event links with an unknown (#3360)", () => {
+  const graph = graphFor(`
+      import { EventEmitter } from 'node:events';
+      class Producer extends EventEmitter {
+        run() { this.on('ready', () => {}); }
+      }
+      class Unrelated extends EventEmitter {
+        run() { this.emit('ready'); }
+      }
+      const stable = new EventEmitter();
+      stable.on('ready', () => {});
+      stable.emit('ready');
+    `);
+  const events = graph.nodes.filter(({ kind }) => kind === "event");
+  const receiverEvent = events.find(
+    ({ properties }) => properties.emitter_key === "this",
+  );
+  const stableEvent = events.find(
+    ({ properties }) => properties.emitter_key !== "this",
+  );
+  if (receiverEvent === undefined || stableEvent === undefined)
+    throw new Error("Expected receiver and stable event nodes");
+  const eventLinks = (nodeId: string) =>
+    graph.relations
+      .filter(
+        ({ relation, source_node_id, target_node_id }) =>
+          ["registers-listener", "dispatches-candidate"].includes(relation) &&
+          (source_node_id === nodeId || target_node_id === nodeId),
+      )
+      .map(({ resolution }) => resolution);
+  expect(eventLinks(receiverEvent.node_id)).toEqual(["candidate", "candidate"]);
+  expect(eventLinks(stableEvent.node_id)).toEqual(["resolved", "resolved"]);
+  expect(
+    graph.unknowns.filter(
+      ({ family, node_id }) =>
+        family === "event" && node_id === receiverEvent.node_id,
+    ),
+  ).not.toHaveLength(0);
+});

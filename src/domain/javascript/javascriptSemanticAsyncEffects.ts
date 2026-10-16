@@ -203,8 +203,12 @@ const emitterIdentity = (
       complete: !semanticResolutionBlocked(state, node, node.name),
     };
   }
+  // Static syntax does not prove which object `this` names: unrelated classes
+  // or functions, call/apply, and inheritance all share the lexical spelling.
+  // Keep one candidate key so related receivers stay linked, but never claim
+  // an exact emitter identity for it.
   if (t.isThisExpression(node))
-    return { key: "this", bindingId: null, complete: true };
+    return { key: "this", bindingId: null, complete: false };
   return {
     key: `expression:${String(node.start ?? -1)}:${String(node.end ?? -1)}`,
     bindingId: null,
