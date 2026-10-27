@@ -124,6 +124,7 @@ const UNKNOWN_PACKAGE: PackageMetadata = {
 const readPackageMetadata = (
   read: ReferenceSourceRead,
   exclusions: HistoricalSourceGraphInput["exclusions"],
+  unobservedPath: (path: string) => boolean,
 ): {
   readonly packages: ReadonlyMap<string, PackageMetadata>;
   readonly pathLookup: ReferenceSourcePathLookup;
@@ -173,6 +174,22 @@ const readPackageMetadata = (
             : { state: "none" },
       });
     } catch {
+      packages.set(directory, UNKNOWN_PACKAGE);
+    }
+  }
+  // An incomplete directory cannot establish that its manifest is absent.
+  const uncertainDirectories = [
+    ...(read.rootFailure === undefined ? [] : ["."]),
+    ...read.entries
+      .filter(
+        (entry) => entry.kind === "directory" && entry.status === "failed",
+      )
+      .map(({ path }) => path),
+  ];
+  for (const directory of uncertainDirectories) {
+    const path = posix.join(directory, "package.json");
+    if (!packages.has(directory) && unobservedPath(path)) {
+      manifestPaths.push(path);
       packages.set(directory, UNKNOWN_PACKAGE);
     }
   }
@@ -226,7 +243,76 @@ interface SpecifierContext {
   readonly lookupPath: ReferenceSourcePathLookup;
   readonly packages: ReadonlyMap<string, PackageMetadata>;
   readonly packageManifestPathLookup: ReferenceSourcePathLookup;
+  readonly unobservedPath: (path: string) => boolean;
 }
+
+/** Earlier unobserved candidates must not be treated as absent. */
+const selectObservedCandidate = (
+  candidates: readonly string[],
+  context: SpecifierContext,
+): Result<string | undefined, undefined> => {
+  const selected = context.lookupPath.resolveCandidates(candidates);
+  for (const candidate of candidates) {
+    const resolved = context.lookupPath.resolve(candidate);
+    if (resolved === selected && selected !== undefined) break;
+    if (
+      (context.lookupPath.has(candidate) && resolved === undefined) ||
+      context.unobservedPath(candidate)
+    )
+      return err(undefined);
+  }
+  return ok(selected);
+};
+
+/** The closest directory observation owns whether an absent child was examined. */
+const unobservedReferencePath = (
+  read: ReferenceSourceRead,
+  exclusions: HistoricalSourceGraphInput["exclusions"],
+): ((path: string) => boolean) => {
+  const observed = createReferenceSourcePathLookup(
+    read.entries.map(({ path }) => path),
+  );
+  const unavailable = createReferenceSourcePathLookup([
+    ...read.entries
+      .filter(
+        (entry) =>
+          entry.kind !== "directory" &&
+          (entry.status === "failed" || entry.kind === "symlink"),
+      )
+      .map(({ path }) => path),
+    ...exclusions
+      .filter((entry) => entry.entry_kind !== "directory")
+      .map(({ path }) => path),
+  ]);
+  const excludedDirectories = createReferenceSourcePathLookup(
+    exclusions
+      .filter((entry) => entry.entry_kind === "directory")
+      .map(({ path }) => path),
+  );
+  const directories = new Map(
+    read.entries
+      .filter((entry) => entry.kind === "directory")
+      .map((entry) => [entry.path, entry.status]),
+  );
+  const directoryLookup = createReferenceSourcePathLookup(directories.keys());
+  return (path) => {
+    if (unavailable.has(path)) return true;
+    if (observed.has(path)) return false;
+    for (
+      let parent = posix.dirname(path);
+      parent !== "." && parent !== "/";
+      parent = posix.dirname(parent)
+    ) {
+      if (excludedDirectories.has(parent)) return true;
+      const directory = directoryLookup.resolve(parent);
+      if (directory !== undefined)
+        return directories.get(directory) === "failed";
+      // A canonical collision cannot establish which directory was examined.
+      if (directoryLookup.has(parent)) return true;
+    }
+    return read.rootFailure !== undefined;
+  };
+};
 
 const packageMainForDirectory = (
   directory: string,
@@ -291,7 +377,9 @@ const selectPackageMain = (
             .filter((suffix) => suffix !== "")
             .map((suffix) => posix.join(target, `index${suffix}`)),
         ];
-  const selected = context.lookupPath.resolveCandidates(candidates);
+  const selection = selectObservedCandidate(candidates, context);
+  if (!selection.ok) return { to: packageDirectory, resolution: "unresolved" };
+  const selected = selection.value;
   return selected === undefined
     ? indexFallback === undefined
       ? { to: packageDirectory, resolution: "unresolved" }
@@ -299,60 +387,11 @@ const selectPackageMain = (
     : { to: selected, resolution: "internal" };
 };
 
-/** Facts from the one ESM URL parse, shared by lookup and unresolved output. */
-interface ImportLookupPath {
-  readonly path: string;
-  readonly directory: boolean;
-  /** Query, fragment, or percent-encoding was part of the request. */
-  readonly interpreted: boolean;
-}
-
-interface ImportLookupRejection {
-  readonly message: string;
-  readonly interpreted: boolean;
-}
-
-/**
- * Cut an ESM specifier at the first raw `?` or `#`. The suffix, marker
- * included, is not a pathname. This is the only split; lookup and unresolved
- * spelling both use it.
- */
-const splitEsmSpecifier = (
-  specifier: string,
-): { readonly pathname: string; readonly suffix: string } => {
-  const componentStart = specifier.search(/[?#]/u);
-  return componentStart === -1
-    ? { pathname: specifier, suffix: "" }
-    : {
-        pathname: specifier.slice(0, componentStart),
-        suffix: specifier.slice(componentStart),
-      };
-};
-
-/**
- * Parse one ESM specifier. Query and fragment end the pathname, and the
- * pathname is percent-decoded once. `%2F`, `%5C`, NUL, and malformed escapes
- * are rejections. Require filenames never reach this parser.
- */
+/** Parse URL syntax before inventory lookup; require filenames remain literal. */
 const importLookupPath = (
   fromPath: string,
   specifier: string,
-): Result<ImportLookupPath, ImportLookupRejection> => {
-  const interpreted = /[?#%]/u.test(specifier);
-  const reject = (message: string) => err({ message, interpreted });
-  // The source directory is encoded into the URL base, so a literal backslash
-  // in that directory becomes `%5C` in the resolved pathname. Apply the
-  // separator policy to the specifier's own pathname. `%5C` is deliberately
-  // stricter than Node: Node 24 on Linux decodes it to a file literally named
-  // `a\b.mjs` and rejects only `%2F`.
-  const { pathname: specifierPath } = splitEsmSpecifier(specifier);
-  if (/%5c/iu.test(specifierPath))
-    return err({
-      message:
-        "Historical module URL paths cannot contain " +
-        "percent-encoded backslash bytes.",
-      interpreted: true,
-    });
+): Result<{ readonly path: string; readonly directory: boolean }, string> => {
   // A private origin is only a logical pathname base, never a filesystem access.
   let source: URL;
   try {
@@ -362,25 +401,21 @@ const importLookupPath = (
     );
   } catch (cause: unknown) {
     if (!(cause instanceof URIError)) throw cause;
-    return reject("The source path cannot be represented as a module URL.");
+    return err("The source path cannot be represented as a module URL.");
   }
   const target = URL.parse(specifier, source);
   if (target === null || target.protocol !== "file:" || target.host !== "")
-    return reject(
+    return err(
       "The module URL cannot be resolved within the source inventory.",
     );
   if (!target.pathname.startsWith("/rea-reference/"))
-    return reject("The module URL escapes the selected source inventory.");
+    return err("The module URL escapes the selected source inventory.");
   const decoded = decodeReferenceSourceModuleUrlPath(
     target.pathname.slice("/rea-reference/".length),
   );
   return decoded.ok
-    ? ok({
-        path: decoded.value,
-        directory: target.pathname.endsWith("/"),
-        interpreted,
-      })
-    : reject(decoded.error);
+    ? ok({ path: decoded.value, directory: target.pathname.endsWith("/") })
+    : decoded;
 };
 
 const resolveInternalSpecifier = (
@@ -388,27 +423,36 @@ const resolveInternalSpecifier = (
   specifier: string,
   context: SpecifierContext,
   mode: InternalSpecifierResolutionMode,
-  lookup?: ImportLookupPath,
 ): {
   to: string;
   resolution: "internal" | "unresolved";
   limitation?: string;
 } => {
-  if (lookup === undefined && posix.isAbsolute(specifier))
+  if (posix.isAbsolute(specifier))
     return { to: specifier, resolution: "unresolved" };
+  const imported =
+    mode === "source-import"
+      ? importLookupPath(fromPath, specifier)
+      : undefined;
+  if (imported !== undefined && !imported.ok)
+    return {
+      to: specifier,
+      resolution: "unresolved",
+      limitation: imported.error,
+    };
   const normalizedPath =
-    lookup === undefined
-      ? posix.normalize(posix.join(posix.dirname(fromPath), specifier))
-      : lookup.path;
+    imported?.ok === true
+      ? imported.value.path
+      : posix.normalize(posix.join(posix.dirname(fromPath), specifier));
   const normalized = normalizedPath.replace(/(?<=.)\/+$/u, "") || ".";
   if (logicalPathEscapesRoot(normalized))
     return { to: normalized, resolution: "unresolved" };
   // Preserve directory intent before normalization removes terminal dot segments.
   const directoryReference =
-    lookup === undefined
-      ? specifier.endsWith("/") ||
-        [".", ".."].includes(posix.basename(specifier))
-      : lookup.directory;
+    imported?.ok === true
+      ? imported.value.directory
+      : specifier.endsWith("/") ||
+        [".", ".."].includes(posix.basename(specifier));
   // A directory resolves only to an index with an extension; neither Node nor
   // TypeScript selects an extensionless `index` file.
   const slots = resolutionSuffixes(mode);
@@ -434,7 +478,26 @@ const resolveInternalSpecifier = (
         ({ path }) => path,
       ),
     );
-  const match = context.lookupPath.resolveCandidates(candidates);
+  const selection = selectObservedCandidate(candidates, context);
+  if (!selection.ok) {
+    // Node consults a known package main before probing directory indexes.
+    // Incomplete index coverage cannot invalidate that observed declaration.
+    if (
+      mode === "runtime-require" &&
+      packageMainForDirectory(normalized, context)?.main.state === "declared"
+    ) {
+      const files = directoryReference
+        ? ok(undefined)
+        : selectObservedCandidate(
+            nodeRequireFileCandidates(normalized),
+            context,
+          );
+      if (files.ok && files.value === undefined)
+        return selectPackageMain(normalized, undefined, context, mode);
+    }
+    return { to: normalized, resolution: "unresolved" };
+  }
+  const match = selection.value;
   if (match === undefined)
     return packageMainForDirectory(normalized, context) !== undefined
       ? selectPackageMain(normalized, undefined, context, mode)
@@ -451,65 +514,6 @@ const resolveInternalSpecifier = (
   return resolvedThroughIndex
     ? selectPackageMain(posix.dirname(match), match, context, mode)
     : { to: match, resolution: "internal" };
-};
-
-/**
- * Source spelling of an unresolved request, before URL interpretation.
- * Only the pathname is joined and normalized. The query or fragment suffix
- * stays as written, so `./missing.mjs?v=1/..` does not collapse to `.`.
- */
-const unresolvedSourceSpelling = (
-  fromPath: string,
-  specifier: string,
-): string => {
-  if (posix.isAbsolute(specifier)) return specifier;
-  const { pathname, suffix } = splitEsmSpecifier(specifier);
-  return (
-    posix.normalize(posix.join(posix.dirname(fromPath), pathname)) + suffix
-  );
-};
-
-/**
- * Source imports use `importLookupPath`'s parsed pathname. An interpreted
- * request that does not match inventory keeps its source spelling. Require
- * modes resolve the literal specifier and do not parse URL components.
- */
-const resolveImportSpecifier = (
-  fromPath: string,
-  specifier: string,
-  context: SpecifierContext,
-  mode: InternalSpecifierResolutionMode,
-): {
-  to: string;
-  resolution: "internal" | "unresolved";
-  limitation?: string;
-} => {
-  if (mode !== "source-import")
-    return resolveInternalSpecifier(fromPath, specifier, context, mode);
-  if (posix.isAbsolute(specifier))
-    return { to: specifier, resolution: "unresolved" };
-  const imported = importLookupPath(fromPath, specifier);
-  if (!imported.ok)
-    return {
-      to: imported.error.interpreted
-        ? unresolvedSourceSpelling(fromPath, specifier)
-        : specifier,
-      resolution: "unresolved",
-      limitation: imported.error.message,
-    };
-  const resolved = resolveInternalSpecifier(
-    fromPath,
-    specifier,
-    context,
-    mode,
-    imported.value,
-  );
-  if (resolved.resolution === "internal" || !imported.value.interpreted)
-    return resolved;
-  return {
-    to: unresolvedSourceSpelling(fromPath, specifier),
-    resolution: "unresolved",
-  };
 };
 
 type ReadFile = Extract<ReferenceSourceEntry, { status: "read"; kind: "file" }>;
@@ -574,7 +578,7 @@ const appendFile = (
         : graphRelationship.kind === "requires"
           ? "source-require"
           : "source-import";
-    const resolved = resolveImportSpecifier(
+    const resolved = resolveInternalSpecifier(
       resolutionBasePath ?? graphRelationship.from_path,
       graphRelationship.to,
       context,
@@ -637,7 +641,6 @@ const appendReadEntry = (
 /** Convert bounded reader observations into graph entries and parsed edges. */
 export const parseReferenceSourceEntries = (
   read: ReferenceSourceRead,
-  filePaths: ReadonlySet<string>,
   exclusions: HistoricalSourceGraphInput["exclusions"],
   signal?: AbortSignal,
 ): ParsedReferenceSourceEntries => {
@@ -651,9 +654,19 @@ export const parseReferenceSourceEntries = (
     output.limitations.push(
       `Reference root enumeration is incomplete: ${read.rootFailure.message}`,
     );
-  const packageInventory = readPackageMetadata(read, exclusions);
+  const unobservedPath = unobservedReferencePath(read, exclusions);
+  const packageInventory = readPackageMetadata(
+    read,
+    exclusions,
+    unobservedPath,
+  );
   const context: SpecifierContext = {
-    lookupPath: createReferenceSourcePathLookup(filePaths),
+    lookupPath: createReferenceSourcePathLookup(
+      read.entries
+        .filter((entry) => entry.status === "read" && entry.kind === "file")
+        .map((entry) => entry.path),
+    ),
+    unobservedPath,
     packages: packageInventory.packages,
     packageManifestPathLookup: packageInventory.pathLookup,
   };

@@ -16,7 +16,7 @@ import {
   expandProviderCapabilities,
   expandToolAvailability,
   providerCapabilitySet,
-  toolAvailabilityInventory,
+  toolAvailabilitySummaryInventory,
 } from "../../src/contracts/toolOutputSchemaPrimitives.js";
 
 import {
@@ -33,6 +33,99 @@ import { cliTest, runFileCli } from "../support/cli/cliFixture.js";
 
 const digest = (bytes: Buffer): string =>
   createHash("sha256").update(bytes).digest("hex");
+
+cliTest.runIf(SQLITE_NATIVE_LIMITS_AVAILABLE)(
+  "unions SQLite cell slices with numeric cell paths",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-sqlite-mixed-filter-");
+    const path = join(root, "selected.db");
+    const database = new DatabaseSync(path);
+    try {
+      database.exec(
+        "CREATE TABLE selected (first TEXT, second TEXT); INSERT INTO selected VALUES ('left', 'right')",
+      );
+    } finally {
+      database.close();
+    }
+    const base = "normalized_result.rows.values[0,1]";
+    for (const filter of [
+      `${base}[0,1].value,${base}.1.value`,
+      `${base}.1.value,${base}[0,1].value`,
+    ]) {
+      const result = await cli.run({
+        arguments: [
+          "inspect-sqlite-database",
+          path,
+          "--table",
+          "selected",
+          "--json",
+          "--filter-output",
+          filter,
+        ],
+        environment: { REA_LOG_LEVEL: "silent" },
+      });
+      expect(result.exitCode, result.stdout + result.stderr).toBe(0);
+      expect(result.json).toEqual({
+        normalized_result: {
+          rows: { values: [[{ value: "left" }, { value: "right" }]] },
+        },
+      });
+    }
+    const refused = await cli.run({
+      arguments: [
+        "inspect-sqlite-database",
+        path,
+        "--table",
+        "selected",
+        "--json",
+        "--filter-output",
+        `${base}[0,1].value,${base}.length`,
+      ],
+      environment: { REA_LOG_LEVEL: "silent" },
+    });
+    expect(refused.exitCode).toBe(1);
+    expect(refused.json).toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("non-index property"),
+    });
+  },
+);
+
+cliTest.runIf(SQLITE_NATIVE_LIMITS_AVAILABLE)(
+  "projects selected SQLite matrix cells through consecutive output slices",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-sqlite-matrix-filter-");
+    const path = join(root, "selected.db");
+    const database = new DatabaseSync(path);
+    try {
+      database.exec(
+        "CREATE TABLE selected (first TEXT, second TEXT); INSERT INTO selected VALUES ('left', 'right')",
+      );
+    } finally {
+      database.close();
+    }
+    const result = await cli.run({
+      arguments: [
+        "inspect-sqlite-database",
+        path,
+        "--table",
+        "selected",
+        "--column",
+        "second",
+        "--column",
+        "first",
+        "--json",
+        "--filter-output",
+        "normalized_result.rows.values[0,1][0,1].value",
+      ],
+      environment: { REA_LOG_LEVEL: "silent" },
+    });
+    expect(result.exitCode, result.stdout + result.stderr).toBe(0);
+    expect(result.json).toEqual({
+      normalized_result: { rows: { values: [[{ value: "right" }]] } },
+    });
+  },
+);
 
 for (const expectedErrno of ["ELOOP", "ENAMETOOLONG"] as const) {
   cliTest.skipIf(expectedErrno === "ELOOP" && process.platform === "win32")(
@@ -369,7 +462,9 @@ cliTest(
     expect(response.isError).not.toBe(true);
     const sessionStatus = z
       .object({
-        result: z.object({ tool_availability: toolAvailabilityInventory }),
+        result: z.object({
+          tool_availability: toolAvailabilitySummaryInventory,
+        }),
       })
       .parse(response.structuredContent);
     expect(

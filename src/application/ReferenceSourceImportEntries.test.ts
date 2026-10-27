@@ -22,7 +22,7 @@ it("projects an unsupported non-regular entry as unknown kind instead of file", 
     bytesRead: 0,
     limitations: [],
   };
-  const parsed = parseReferenceSourceEntries(read, new Set(), []);
+  const parsed = parseReferenceSourceEntries(read, []);
   expect(parsed.entries).toContainEqual({
     path: "src/pipe",
     kind: "unknown",
@@ -49,7 +49,7 @@ it("keeps a failed regular file as file kind", () => {
     bytesRead: 0,
     limitations: [],
   };
-  const parsed = parseReferenceSourceEntries(read, new Set(), []);
+  const parsed = parseReferenceSourceEntries(read, []);
   expect(parsed.entries).toContainEqual({
     path: "src/broken.ts",
     kind: "file",
@@ -85,11 +85,7 @@ it("keeps source entries when a module has an empty specifier", () => {
     limitations: [],
   };
 
-  const parsed = parseReferenceSourceEntries(
-    read,
-    new Set(files.map(([path]) => path)),
-    [],
-  );
+  const parsed = parseReferenceSourceEntries(read, []);
 
   expect(parsed.entries.map(({ path }) => path)).toEqual([
     "main.mjs",
@@ -134,11 +130,7 @@ it("retains Kotlin source identity and language across the inventory projection"
     ),
     limitations: [],
   };
-  const parsed = parseReferenceSourceEntries(
-    read,
-    new Set(files.map(([path]) => path)),
-    [],
-  );
+  const parsed = parseReferenceSourceEntries(read, []);
   for (const [path, content, classifications, language] of files)
     expect(parsed.entries).toContainEqual({
       path,
@@ -206,11 +198,7 @@ it("resolves declared package mains and index fallback from source-owned fields"
       writable: true,
       value: "phantom.js",
     });
-    parsed = parseReferenceSourceEntries(
-      read,
-      new Set(files.map(([path]) => path)),
-      [],
-    );
+    parsed = parseReferenceSourceEntries(read, []);
   } finally {
     if (previous === undefined)
       Reflect.deleteProperty(Object.prototype, "main");
@@ -307,11 +295,7 @@ it("matches package manifests by exact or unique canonical directory identity", 
     limitations: [],
   };
 
-  const parsed = parseReferenceSourceEntries(
-    read,
-    new Set(files.map(([path]) => path)),
-    [],
-  );
+  const parsed = parseReferenceSourceEntries(read, []);
 
   expect(parsed.relationships.map(({ to }) => to)).toEqual([
     `${decomposed}/unique.js`,
@@ -346,11 +330,7 @@ it("resolves extensionless imports and requires to .mts and .cts files and direc
     ),
     limitations: [],
   };
-  const parsed = parseReferenceSourceEntries(
-    read,
-    new Set(files.map(([path]) => path)),
-    [],
-  );
+  const parsed = parseReferenceSourceEntries(read, []);
   expect(parsed.relationships).toEqual(
     expect.arrayContaining([
       {
@@ -385,225 +365,277 @@ it("resolves extensionless imports and requires to .mts and .cts files and direc
   );
 });
 
-const readSource = (
-  files: readonly (readonly [string, string])[],
-): ReferenceSourceRead => ({
-  root: "/selected/source",
-  entries: files.map(([path, content]) => ({
+it("does not infer missing candidates or manifests from partial directory enumeration", () => {
+  const file = (
+    path: string,
+    content: string,
+  ): ReferenceSourceRead["entries"][number] => ({
     status: "read",
     kind: "file",
     path,
     bytes: Buffer.from(content),
     size: Buffer.byteLength(content),
-  })),
-  bytesRead: files.reduce(
-    (sum, [, content]) => sum + Buffer.byteLength(content),
-    0,
-  ),
-  limitations: [],
-});
-
-const relationshipsOf = (files: readonly (readonly [string, string])[]) =>
-  parseReferenceSourceEntries(
-    readSource(files),
-    new Set(files.map(([path]) => path)),
-    [],
-  ).relationships;
-
-it("resolves query and fragment ESM requests to the inventoried pathname (#3916)", () => {
-  const relationships = relationshipsOf([
-    [
-      "main.mjs",
-      'import "./dep.mjs?revision=1#first";\n' +
-        'import "./query.mjs?v=2";\n' +
-        'import "./fragment.mjs#part";\n' +
-        'await import("./dynamic.mjs?lazy");\n',
+  });
+  const read: ReferenceSourceRead = {
+    root: "/selected/source",
+    bytesRead: 0,
+    limitations: [],
+    entries: [
+      file("package.json", '{"type":"commonjs"}'),
+      file(
+        "main.cjs",
+        'require("./pkg"); require("./other"); require("./exact.js");',
+      ),
+      file("pkg/index.js", "module.exports = 1;"),
+      file("other/index.js", "module.exports = 1;"),
+      file("exact.js", "module.exports = 1;"),
+      file("pkg/source.js", 'require("../exact.js");'),
+      {
+        status: "failed",
+        kind: "directory",
+        path: "pkg",
+        code: "io",
+        message: "Partial enumeration",
+      },
+      { status: "read", kind: "directory", path: "other" },
     ],
-    ["dep.mjs", "export const value = 1;\n"],
-    ["query.mjs", "export const value = 2;\n"],
-    ["fragment.mjs", "export const value = 3;\n"],
-    ["dynamic.mjs", "export const value = 4;\n"],
+  };
+  const parsed = parseReferenceSourceEntries(read, []);
+  expect(
+    parsed.relationships.filter(({ from_path }) => from_path === "main.cjs"),
+  ).toEqual([
+    expect.objectContaining({ to: "pkg", resolution: "unresolved" }),
+    expect.objectContaining({ to: "other/index.js", resolution: "internal" }),
+    expect.objectContaining({ to: "exact.js", resolution: "internal" }),
   ]);
-  for (const to of ["dep.mjs", "query.mjs", "fragment.mjs", "dynamic.mjs"])
-    expect(relationships).toContainEqual(
-      expect.objectContaining({
-        from_path: "main.mjs",
-        to,
-        resolution: "internal",
-      }),
-    );
-});
-
-it("resolves an ESM query to the pathname even when a literal-suffix filename is inventoried", () => {
-  const relationships = relationshipsOf([
-    ["main.mjs", 'import "./dep.mjs?v=1";\n'],
-    ["dep.mjs", "export const value = 1;\n"],
-    ["dep.mjs?v=1", "export const value = 2;\n"],
-  ]);
-  expect(relationships).toContainEqual(
+  expect(
+    parsed.relationships.filter(
+      ({ from_path }) => from_path === "pkg/source.js",
+    ),
+  ).not.toContainEqual(expect.objectContaining({ resolution: "internal" }));
+  const partialRoot = parseReferenceSourceEntries(
+    { ...read, rootFailure: { code: "io", message: "Partial root" } },
+    [],
+  );
+  expect(
+    partialRoot.relationships.find(
+      ({ from_path, to }) =>
+        from_path === "main.cjs" && to === "other/index.js",
+    ),
+  ).toBeUndefined();
+  expect(partialRoot.relationships).toContainEqual(
     expect.objectContaining({
-      from_path: "main.mjs",
-      to: "dep.mjs",
+      from_path: "main.cjs",
+      to: "exact.js",
       resolution: "internal",
     }),
   );
-  expect(relationships).not.toContainEqual(
-    expect.objectContaining({ to: "dep.mjs?v=1" }),
-  );
 });
 
-it("decodes percent-encoded ESM pathnames to literal filenames", () => {
-  const relationships = relationshipsOf([
-    [
-      "main.mjs",
-      'import "./dep.mjs%3Fv=1";\n' +
-        'import "./name%3Fq.mjs?v=2";\n' +
-        'import "./a%20b.mjs";\n',
-    ],
-    ["dep.mjs", "export const value = 1;\n"],
-    ["dep.mjs?v=1", "export const value = 2;\n"],
-    ["name?q.mjs", "export const value = 3;\n"],
-    ["a b.mjs", "export const value = 4;\n"],
-  ]);
-  for (const to of ["dep.mjs?v=1", "name?q.mjs", "a b.mjs"])
-    expect(relationships).toContainEqual(
-      expect.objectContaining({
-        from_path: "main.mjs",
-        to,
-        resolution: "internal",
-      }),
+it.each(["failed", "excluded"] as const)(
+  "keeps higher priority %s candidates unknown",
+  (state) => {
+    const files = [
+      ["main.cjs", 'require("./pkg"); require("./pkg/index.js");'],
+      ["pkg/index.js", "module.exports = 1;"],
+    ] as const;
+    const read: ReferenceSourceRead = {
+      root: "/selected/source",
+      bytesRead: 0,
+      limitations: [],
+      entries: [
+        ...files.map(([path, content]) => ({
+          status: "read" as const,
+          kind: "file" as const,
+          path,
+          bytes: Buffer.from(content),
+          size: Buffer.byteLength(content),
+        })),
+        ...(state === "failed"
+          ? [
+              {
+                status: "failed" as const,
+                kind: "file" as const,
+                path: "pkg.js",
+                code: "io" as const,
+                message: "Unreadable",
+              },
+            ]
+          : []),
+      ],
+    };
+    const parsed = parseReferenceSourceEntries(
+      read,
+      state === "excluded"
+        ? [
+            {
+              path: "pkg.js",
+              entry_kind: "file",
+              reason: "caller-excluded",
+              pattern: "pkg.js",
+            },
+          ]
+        : [],
     );
-  expect(relationships).not.toContainEqual(
-    expect.objectContaining({ to: "dep.mjs" }),
-  );
-});
+    expect(parsed.relationships).toEqual([
+      expect.objectContaining({ to: "pkg", resolution: "unresolved" }),
+      expect.objectContaining({ to: "pkg/index.js", resolution: "internal" }),
+    ]);
+  },
+);
 
-it("leaves ESM pathnames Node rejects unresolved with their source spelling", () => {
-  const relationships = relationshipsOf([
-    ["main.mjs", 'import "./sub%2Fx.mjs";\nimport "./100%.mjs";\n'],
-    ["sub/x.mjs", "export const value = 1;\n"],
-    ["100%.mjs", "export const value = 2;\n"],
-  ]);
-  for (const to of ["sub%2Fx.mjs", "100%.mjs"])
-    expect(relationships).toContainEqual(
-      expect.objectContaining({
-        from_path: "main.mjs",
-        to,
-        resolution: "unresolved",
-      }),
-    );
-});
-
-it("leaves ./a%5Cb.mjs unresolved, stricter than Node's backslash decode", () => {
-  // Node 24 on Linux decodes `%5C` to a file literally named `a\b.mjs` and
-  // rejects only `%2F`. This inventory rejects the encoded separator instead.
-  const relationships = relationshipsOf([
-    ["main.mjs", 'import "./a%5Cb.mjs";\n'],
-    ["a\\b.mjs", "export const value = 1;\n"],
-  ]);
-  expect(relationships).toContainEqual(
-    expect.objectContaining({
-      from_path: "main.mjs",
-      to: "a%5Cb.mjs",
-      resolution: "unresolved",
-    }),
+it("retains observed manifests and closer completed scopes inside a partial inventory", () => {
+  const files = [
+    ["main.cjs", 'require("./pkg");'],
+    ["pkg/package.json", '{"main":"entry.js","type":"commonjs"}'],
+    ["pkg/entry.js", 'require("./known.js");'],
+    ["pkg/known.js", "module.exports = 1;"],
+    ["complete/source.js", 'require("./known.js");'],
+    ["complete/known.js", "module.exports = 1;"],
+    ["complete/package.json", '{"type":"commonjs"}'],
+  ] as const;
+  const parsed = parseReferenceSourceEntries(
+    {
+      root: "/selected/source",
+      bytesRead: 0,
+      limitations: [],
+      entries: [
+        ...files.map(([path, content]) => ({
+          status: "read" as const,
+          kind: "file" as const,
+          path,
+          bytes: Buffer.from(content),
+          size: Buffer.byteLength(content),
+        })),
+        {
+          status: "failed",
+          kind: "directory",
+          path: "pkg",
+          code: "io",
+          message: "Partial enumeration",
+        },
+        { status: "read", kind: "directory", path: "complete" },
+      ],
+    },
+    [],
   );
-  expect(relationships).not.toContainEqual(
-    expect.objectContaining({ to: "a\\b.mjs", resolution: "internal" }),
-  );
-});
-
-it("keeps an unmatched query-bearing ESM request unresolved", () => {
-  expect(
-    relationshipsOf([["main.mjs", 'import "./missing.mjs?v=1";\n']]),
-  ).toContainEqual(
-    expect.objectContaining({
-      from_path: "main.mjs",
-      to: "missing.mjs?v=1",
-      resolution: "unresolved",
-    }),
-  );
-});
-
-it("keeps dot segments inside an unmatched ESM query", () => {
-  expect(
-    relationshipsOf([["main.mjs", 'import "./missing.mjs?v=1/..";\n']]),
-  ).toContainEqual(
-    expect.objectContaining({
-      from_path: "main.mjs",
-      to: "missing.mjs?v=1/..",
-      resolution: "unresolved",
-    }),
-  );
-});
-
-it("keeps dot segments inside an unmatched ESM fragment", () => {
-  expect(
-    relationshipsOf([["main.mjs", 'import "./missing.mjs#a/../b";\n']]),
-  ).toContainEqual(
-    expect.objectContaining({
-      from_path: "main.mjs",
-      to: "missing.mjs#a/../b",
-      resolution: "unresolved",
-    }),
-  );
-});
-
-it("keeps an unmatched ESM query when the importer is in a subdirectory", () => {
-  const relationships = relationshipsOf([
-    ["pkg/main.mjs", 'import "./missing.mjs?v=1/..";\n'],
-    ["main.mjs", 'import "./pkg/missing.mjs?v=1/..";\n'],
-  ]);
-  expect(relationships).toContainEqual(
-    expect.objectContaining({
-      from_path: "pkg/main.mjs",
-      to: "pkg/missing.mjs?v=1/..",
-      resolution: "unresolved",
-    }),
-  );
-  expect(relationships).toContainEqual(
-    expect.objectContaining({
-      from_path: "main.mjs",
-      to: "pkg/missing.mjs?v=1/..",
-      resolution: "unresolved",
-    }),
-  );
-});
-
-it("does not strip a query from a CommonJS require specifier", () => {
-  expect(
-    relationshipsOf([
-      ["main.cjs", 'require("./dep.js?v=1");\n'],
-      ["dep.js", "module.exports = 1;\n"],
-    ]),
-  ).toContainEqual(
+  expect(parsed.relationships).toEqual([
     expect.objectContaining({
       from_path: "main.cjs",
-      resolution: "unresolved",
+      to: "pkg/entry.js",
+      resolution: "internal",
     }),
-  );
+    expect.objectContaining({
+      from_path: "pkg/entry.js",
+      to: "pkg/known.js",
+      resolution: "internal",
+    }),
+    expect.objectContaining({
+      from_path: "complete/source.js",
+      to: "complete/known.js",
+      resolution: "internal",
+    }),
+  ]);
 });
 
-it("keeps CommonJS require specifiers literal", () => {
-  expect(
-    relationshipsOf([
-      ["main.cjs", 'require("./dep.js?v=1");\nrequire("./a%20b.js");\n'],
-      ["dep.js", "module.exports = 1;\n"],
-      ["dep.js?v=1", "module.exports = 2;\n"],
-      ["a b.js", "module.exports = 3;\n"],
-    ]),
-  ).toEqual(
-    expect.arrayContaining([
-      expect.objectContaining({
-        from_path: "main.cjs",
-        to: "dep.js?v=1",
-        resolution: "internal",
-      }),
-      expect.objectContaining({
-        from_path: "main.cjs",
-        to: "a%20b.js",
-        resolution: "unresolved",
-      }),
-    ]),
+it("keeps ambiguous directory coverage unknown while honoring exact directory identity", () => {
+  const first = "a\u0301\u0323";
+  const second = "a\u0323\u0301";
+  const ambiguous = "\u1ea1\u0301";
+  const files = [
+    ["main.cjs", `require("./${ambiguous}/dep"); require("./${second}/dep");`],
+    [`${ambiguous}/dep.js`, "module.exports = 1;"],
+    [`${second}/dep.js`, "module.exports = 2;"],
+  ] as const;
+  const parsed = parseReferenceSourceEntries(
+    {
+      root: "/selected/source",
+      bytesRead: 0,
+      limitations: [],
+      entries: [
+        ...files.map(([path, content]) => ({
+          status: "read" as const,
+          kind: "file" as const,
+          path,
+          bytes: Buffer.from(content),
+          size: Buffer.byteLength(content),
+        })),
+        {
+          status: "failed",
+          kind: "directory",
+          path: first,
+          code: "io",
+          message: "Partial enumeration",
+        },
+        { status: "read", kind: "directory", path: second },
+      ],
+    },
+    [],
   );
+  expect(parsed.relationships).toEqual([
+    expect.objectContaining({
+      to: `${ambiguous}/dep`,
+      resolution: "unresolved",
+    }),
+    expect.objectContaining({ to: `${second}/dep.js`, resolution: "internal" }),
+  ]);
+});
+
+it("does not skip an ambiguous higher priority file for an observed extension fallback", () => {
+  const first = "a\u0301\u0323";
+  const second = "a\u0323\u0301";
+  const ambiguous = "\u1ea1\u0301";
+  const files = [
+    ["main.cjs", `require("./${ambiguous}"); require("./${first}");`],
+    [first, "module.exports = 1;"],
+    [second, "module.exports = 2;"],
+    [`${ambiguous}.js`, "module.exports = 3;"],
+  ] as const;
+  const parsed = parseReferenceSourceEntries(
+    {
+      root: "/selected/source",
+      bytesRead: 0,
+      limitations: [],
+      entries: files.map(([path, content]) => ({
+        status: "read" as const,
+        kind: "file" as const,
+        path,
+        bytes: Buffer.from(content),
+        size: Buffer.byteLength(content),
+      })),
+    },
+    [],
+  );
+  expect(parsed.relationships).toEqual([
+    expect.objectContaining({ to: ambiguous, resolution: "unresolved" }),
+    expect.objectContaining({ to: first, resolution: "internal" }),
+  ]);
+});
+
+it("prefers a later exact filename over an earlier unique canonical candidate", () => {
+  const composed = "caf\u00e9";
+  const decomposed = "cafe\u0301";
+  const files = [
+    ["main.cjs", `require("./${composed}");`],
+    [decomposed, "module.exports = 1;"],
+    [`${composed}.js`, "module.exports = 2;"],
+  ] as const;
+  const parsed = parseReferenceSourceEntries(
+    {
+      root: "/selected/source",
+      bytesRead: 0,
+      limitations: [],
+      entries: files.map(([path, content]) => ({
+        status: "read" as const,
+        kind: "file" as const,
+        path,
+        bytes: Buffer.from(content),
+        size: Buffer.byteLength(content),
+      })),
+    },
+    [],
+  );
+  expect(parsed.relationships).toEqual([
+    expect.objectContaining({ to: `${composed}.js`, resolution: "internal" }),
+  ]);
 });

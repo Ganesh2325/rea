@@ -1,3 +1,4 @@
+import { appendCallerPath } from "../filesystem/callerPath.js";
 import {
   isClientConfigurationCleanupFailure,
   retryClientConfigurationCleanup,
@@ -18,12 +19,15 @@ import { ConfigurationError } from "../domain/configurationErrors.js";
 import { copyFile, lstat, realpath, rm, rmdir } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { homeDirectoryFromEnvironment } from "../config/homeDirectory.js";
-import { basename, dirname, join } from "node:path";
-import { defaultKunaCacheDirectory } from "../config/kunaCacheDirectory.js";
+import { basename, dirname } from "node:path";
+import {
+  defaultKunaCacheDirectory,
+  sameLexicalDirectory,
+} from "../config/kunaCacheDirectory.js";
 import { linuxHopperReleaseCacheDirectory } from "./LinuxHopperCacheDirectory.js";
 
 import { ClientConfigurationPublication } from "./ClientConfigurationPublication.js";
-import { parseClientRegistrationLauncher } from "./ClientRegistration.js";
+import { clientRegistrationOwnership } from "./ClientRegistration.js";
 
 import { PRODUCT_IDENTITY } from "../identity.js";
 import {
@@ -32,8 +36,6 @@ import {
   readSkillFile,
   skillDestinationSelection,
 } from "./SetupSkill.js";
-import { classifyClientRegistrationCommand } from "./ClientRegistrationIdentity.js";
-import { CURRENT_ENTRYPOINT_PATH } from "../process/CurrentEntrypointPath.js";
 import { dshDocument } from "./DshCordisPatch.js";
 import { resolveClientConfigTransactionPath } from "./ClientConfigPath.js";
 import {
@@ -784,11 +786,11 @@ const clientRegistrationRemoval = (
   const removeNative =
     (parsed.dialect === "dsh" && dshDocument(parsed.document).carriesEntry) ||
     (Object.hasOwn(parsed.servers, name) &&
-      isOwnedRegistration(parsed.servers[name], client));
+      clientRegistrationOwnership(parsed.servers[name], client) === "owned");
   const legacyPath = legacyClientServerPath(parsed, name);
   const removeLegacy =
     legacyPath !== undefined &&
-    isOwnedRegistration(parsed.legacyServers[name], client);
+    clientRegistrationOwnership(parsed.legacyServers[name], client) === "owned";
   const ownership: RegistrationRemoval = {
     removeNative,
     legacyPath: removeLegacy ? legacyPath : undefined,
@@ -798,11 +800,11 @@ const clientRegistrationRemoval = (
     if (
       (removeNative &&
         shadowed.servers.some(
-          (member) => !isOwnedRegistration(member, client),
+          (member) => clientRegistrationOwnership(member, client) !== "owned",
         )) ||
       (removeLegacy &&
         shadowed.legacyServers.some(
-          (member) => !isOwnedRegistration(member, client),
+          (member) => clientRegistrationOwnership(member, client) !== "owned",
         ))
     )
       return err({
@@ -962,11 +964,9 @@ const removeClient = async (
   try {
     return await publication.verify(async () => {
       try {
-        const readback = parseClientConfiguration(
-          await fileSystem.readText(publication.path),
-          client.format,
-        );
-        await publication.assertCurrent();
+        const text = await fileSystem.readText(publication.path);
+        await publication.assertCurrent(text);
+        const readback = parseClientConfiguration(text, client.format);
         if (
           (removeNative && Object.hasOwn(readback.servers, name)) ||
           (readback.dialect === "dsh" &&
@@ -1025,19 +1025,6 @@ const resolveUninstallConfigPath = async (
   );
 };
 
-/** Ownership rule for persistent MCP registrations created by REA setup. */
-const isOwnedRegistration = (value: unknown, client: SetupClient): boolean => {
-  const parsed = parseClientRegistrationLauncher(value, client);
-  if (!parsed.ok) return false;
-  const { command, args } = parsed.value;
-  return (
-    classifyClientRegistrationCommand(
-      [command, ...args],
-      CURRENT_ENTRYPOINT_PATH,
-    ) === "owned"
-  );
-};
-
 /** Purge the same default cache namespaces selected by their producers. */
 const purgeSelectedData = async (
   home: string,
@@ -1045,17 +1032,20 @@ const purgeSelectedData = async (
   platform: NodeJS.Platform,
   fileSystem: UninstallFileSystem,
 ): Promise<readonly UninstallItem[]> => {
-  const items = [
-    ...(await purgeManagedData(join(home, ".rea"), fileSystem, [
-      "cache",
-      "state",
-    ])),
-  ];
+  const items: UninstallItem[] = [];
   const directories: string[] = [];
   if (platform === "darwin" || platform === "linux") {
-    directories.push(defaultKunaCacheDirectory(home, environment, platform));
+    const defaultCache = defaultKunaCacheDirectory(home, environment, platform);
+    directories.push(defaultCache);
     const custom = environment.REA_KUNA_CACHE_DIR;
-    if (custom !== undefined && custom !== directories[0])
+    // Lexical spellings identify the default namespace for reporting.
+    // Removal still uses the owned-path checks below. Other selections
+    // remain separately reported without resolving symbolic links.
+    if (
+      custom !== undefined &&
+      custom !== defaultCache &&
+      !sameLexicalDirectory(custom, defaultCache, platform)
+    )
       items.push(
         item(
           "kuna-custom-cache",
@@ -1069,6 +1059,14 @@ const purgeSelectedData = async (
     if (hopper.ok) directories.push(hopper.value);
     else items.push(item("hopper-releases", "failed", hopper.error.message));
   }
+  // Resolve selections before a managed namespace removal can delete cwd.
+  // Keep the existing result and removal order after planning those facts.
+  items.unshift(
+    ...(await purgeManagedData(appendCallerPath(home, ".rea"), fileSystem, [
+      "cache",
+      "state",
+    ])),
+  );
   for (const directory of directories)
     items.push(
       ...(await purgeManagedData(dirname(directory), fileSystem, [
@@ -1097,7 +1095,11 @@ const purgeManagedData = async (
   } catch (cause: unknown) {
     return names.map((name) =>
       isMissing(cause)
-        ? item(name, "skipped", `${join(root, name)} does not exist.`)
+        ? item(
+            name,
+            "skipped",
+            `${appendCallerPath(root, name)} does not exist.`,
+          )
         : item(
             name,
             "failed",
@@ -1107,7 +1109,9 @@ const purgeManagedData = async (
   }
   const items: UninstallItem[] = [];
   for (const name of names)
-    items.push(await removeManagedPath(join(root, name), name, fileSystem));
+    items.push(
+      await removeManagedPath(appendCallerPath(root, name), name, fileSystem),
+    );
   return items;
 };
 
@@ -1210,7 +1214,7 @@ const inspectManagedSkill = async (
   if (root.isDirectory?.() !== true)
     return item(name, "retained", "Skill path is not a directory.");
 
-  const manifestPath = join(path, "SKILL.md");
+  const manifestPath = appendCallerPath(path, "SKILL.md");
   try {
     const manifest = await fileSystem.stat(manifestPath);
     if (manifest.isSymbolicLink())
@@ -1315,7 +1319,9 @@ const removeEmptyManagedDirectories = async (
 ): Promise<UninstallItem | undefined> => {
   if (fileSystem.removeEmptyDirectory === undefined) return undefined;
   for (const directory of [
-    ...MANAGED_SKILL_DIRECTORIES.map((relative) => join(root, relative)),
+    ...MANAGED_SKILL_DIRECTORIES.map((relative) =>
+      appendCallerPath(root, relative),
+    ),
     root,
   ]) {
     try {
@@ -1347,7 +1353,7 @@ const removeManagedSkillFile = async (
   const segments = relativePath.split(/[\\/]/u);
   let parent = root;
   for (const segment of segments.slice(0, -1)) {
-    parent = join(parent, segment);
+    parent = appendCallerPath(parent, segment);
     try {
       const stats = await fileSystem.stat(parent);
       if (stats.isSymbolicLink() || stats.isDirectory?.() !== true)
@@ -1361,7 +1367,7 @@ const removeManagedSkillFile = async (
         ? item(
             name,
             "skipped",
-            `${join(parent, segments.at(-1) ?? "")} does not exist.`,
+            `${appendCallerPath(parent, segments.at(-1) ?? "")} does not exist.`,
           )
         : item(
             name,
@@ -1371,7 +1377,7 @@ const removeManagedSkillFile = async (
     }
   }
 
-  const target = join(root, relativePath);
+  const target = appendCallerPath(root, relativePath);
   let stats: ManagedPathStats;
   try {
     stats = await fileSystem.stat(target);
